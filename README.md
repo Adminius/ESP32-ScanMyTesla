@@ -1,2 +1,12 @@
 # ESP32-ScanMyTesla
-CAN to BlueTooth Adapter for ScanMyTesla on ESP32
+CAN to BlueTooth Adapter for [ScanMyTesla](https://sites.google.com/view/scanmytesla/home) on ESP32
+
+
+## Hardware
+- Any ESP32 based board. (e.g. Wemos D1 mini ESP32)
+- Any DC-DC Step Down to 5V, because most ESP32 boards can't handle car voltages (~14V). (e.g. DC Power Shield for WEMOS D1 mini)
+- SN65HVD230 CAN bus transceiver **without termination resistor**
+
+## Connection
+
+![Connection diagram](ESP32_can_connection.png "Connection diagram")
