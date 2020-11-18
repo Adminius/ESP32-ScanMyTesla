@@ -1,5 +1,5 @@
 /*
-ESP32-ScanMyTesla 1.0.0 (2020)
+ESP32-ScanMyTesla 1.0.1 (2020)
 Author: E.Burkowski
 GENERAL PUBLIC LICENSE
 */
@@ -35,25 +35,27 @@ uint32_t canDataBufferId[BUFFER_LENGTH];
 
 //some CAN dumps to simulate can bus without physical HW
 #ifdef DATA_SIMULATION
-byte canDataBufferTest[5][8] = {
+byte canDataBufferTest[6][8] = {
                         {0x2e, 0x97, 0xF6, 0xFF, 0xFD, 0x26, 0xFF, 0x0F}, //1322e97f6fffd26ff0f
                         {0xE3, 0x24, 0x55, 0x20, 0xFF, 0x1F, 0xFF, 0x3F}, //129E3245520FF1FFF3F 
-                        {0xE6, 0x2E, 0x6A, 0xA8, 0xA1, 0x15, 0x84, 0x00}, //352E62E6AA8A1158400
+                        {0xD8, 0xCA, 0x8F, 0x7D, 0xEC, 0x43, 0x85, 0x10}, //352d8ca8f7dec438510
                         {0x73, 0xB7, 0x9D, 0x77, 0xDD, 0x0A, 0x03, 0x00}, //29273B79D77DD0A0300
-                        {0x00, 0x00, 0x0F, 0x09, 0x00, 0x00, 0xA0, 0x0F}}; //25200000F090000A00F
-byte canDataBufferLengthTest[5] = {8, 8, 8, 8, 8};
-uint32_t canDataBufferIdTest[5] = {0x132, 0x129, 0x352, 0x292, 0x252};
+                        {0x00, 0x00, 0x0F, 0x09, 0x00, 0x00, 0xA0, 0x0F}, //25200000F090000A00F
+                        {0x2e, 0x97, 0xF2, 0xFF, 0xF6, 0x26, 0xFF, 0x0F}  //132e979f2fff626ff0f
+                        }; 
+byte canDataBufferLengthTest[6] = {8, 8, 8, 8, 8, 8};
+uint32_t canDataBufferIdTest[6] = {0x132, 0x129, 0x352, 0x292, 0x252, 0x132};
 byte lastTestMessage = 0;
 #endif
 
-//static, for ELM327
+//static Model 3 filters, for ELM327 simulation
 uint32_t relevantIds[] = {0x108, 0x118, 0x129, 0x132, 0x1D5, 0x1D8, 0x186,
                           0x20C, 0x212, 0x241, 0x244, 0x252, 0x257, 0x261, 0x264, 0x266, 
                           0x267, 0x268, 0x292, 0x29D, 0x2A8, 0x2B4, 0x2C1, 0x2D2, 0x2E5, 
                           0x312, 0x315, 0x321, 0x332, 0x334, 0x336, 0x33A, 0x352, 0x376, 
                           0x381, 0x382, 0x395, 0x396, 0x3A1, 0x3B6, 0x3D2, 0x3F2, 0x3FE, 
                           0x401, 0x541, 0x557, 0x5D7, 0x692};
-
+bool noFilter = true;
 char btBufferCounter = 0;
 char buffer[128];
 String lineEnd = String("\n");
@@ -69,7 +71,7 @@ void printFrame(CAN_FRAME *message)
 {
     Serial.print(message->id, HEX);
     Serial.print(" ");
-    for (int i = 0; i < message->length; i++) {
+    for (byte i = 0; i < message->length; i++) {
         if(message->data.byte[i] < 16) Serial.print("0");
         Serial.print(message->data.byte[i], HEX);
         Serial.print(" ");
@@ -113,6 +115,7 @@ void setup() {
     for(byte i = 0; i < sizeof(relevantIds)/sizeof(relevantIds[0]); i++){
         ids[relevantIds[i]] = 0x01; //it will work until other bits in CAN-ID settings are not defined
     }
+    noFilter = false; //there are some filters
 }
 
 
@@ -182,17 +185,25 @@ String processSmtCommands(char *smtCmd){
             sFilter = cmd.substring(9,6); //why 9,6?!? it should be 6,3!! 
             const char * chCmd = sFilter.c_str(); //HEX string (3d2)
             filter = strtol(chCmd, 0, 16); //convert HEX string to integer (978)
+            if(noFilter){ 
+                memset(ids, 0x00, sizeof(ids)); //if there no filters, all IDs are allowed. But we need only one => disallow all and allow one
+                noFilter = false; //no filtes at all
+#ifdef DEBUG
+            Serial.println("No IDs are allowed now");
+#endif
+            }
 #ifdef DEBUG
             Serial.print("New filter from SMT: ");
-            Serial.println(filter);  
-#endif 
+            Serial.println(filter, HEX);  
+#endif
             ids[filter] = 0x01; //it will work until other bits in CAN-ID settings are not defined
             returnToSmt.concat("OK");
         }else if(!strncmp(smtCmd, "stfcp", 5)){
 #ifdef DEBUG
-            Serial.println("Clear all filters");
+            Serial.println("Clear all filters = allow all IDs!");
 #endif
-            memset(ids, B00000000, sizeof(ids));
+            memset(ids, 0x01, sizeof(ids)); //clear all filters = allow all IDs. It will work until other bits in CAN-ID settings are not defined
+            noFilter = true; //no filtes at all
             returnToSmt.concat("OK");
         }else{
             //all other at* commands, we don't care, send "OK"...
