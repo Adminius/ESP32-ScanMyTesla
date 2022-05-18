@@ -210,9 +210,9 @@ String processSmtCommands(char *smtCmd){
             returnToSmt.concat("OK");
         }
         returnToSmt.concat(">");
-    }else{
-        returnToSmt.concat(lineEnd); //we are not allowed to send "NULL" to BT, send atleast "CR" 
     }
+    returnToSmt.concat(lineEnd); //always send "NewLine" at the end
+    
     return returnToSmt;  
 }
 
