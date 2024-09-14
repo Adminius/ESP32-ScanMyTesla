@@ -1,157 +1,192 @@
 /*
-ESP32-ScanMyTesla 1.0.1 (2020)
+ESP32-ScanMyTesla 2.0.0 (2024)
 Author: E.Burkowski
 GENERAL PUBLIC LICENSE
 */
 
-#include <esp32_can.h>  //https://github.com/collin80/esp32_can and https://github.com/collin80/can_common
+#include "driver/twai.h"
 #include <BluetoothSerial.h>
 
-/* CAN-ID settings:
- *  7 6 5 4 3 2 1 0
- *  Bit 0: 0 - ignore, 1 - relevant
- *  Bit 1: tbd
- *  Bit 2: tbd
- *  Bit 3: tbd
- *  Bit 4: tbd
- *  Bit 5: tbd
- *  Bit 6: tbd
- *  Bit 7: tbd
- */
 
-#define CAN_ID_BIT_RELEVANT 0  //mask for CAN-ID settings
-#define BUFFER_LENGTH 16       //play with this size to get better packtes/second
+#define BUFFER_LENGTH 16       //play with this size to get better packets/second
 
-//#define DEBUG                 //serial debug output
-//#define DATA_SIMULATION       //use test data without can hardware
+#define RX_PIN 16
+#define TX_PIN 17
 
-byte messageCounter = 0;
- 
-//it's not RAM optimized (we have enough), but it should be very fast. do it better later...
-byte ids[2048];
-byte canDataBuffer[BUFFER_LENGTH][8];
-byte canDataBufferLength[BUFFER_LENGTH];
-uint32_t canDataBufferId[BUFFER_LENGTH];
+//#define DEBUG                  //serial debug output
 
-//some CAN dumps to simulate can bus without physical HW
-#ifdef DATA_SIMULATION
-byte canDataBufferTest[6][8] = {
-                        {0x2e, 0x97, 0xF6, 0xFF, 0xFD, 0x26, 0xFF, 0x0F}, //1322e97f6fffd26ff0f
-                        {0xE3, 0x24, 0x55, 0x20, 0xFF, 0x1F, 0xFF, 0x3F}, //129E3245520FF1FFF3F 
-                        {0xD8, 0xCA, 0x8F, 0x7D, 0xEC, 0x43, 0x85, 0x10}, //352d8ca8f7dec438510
-                        {0x73, 0xB7, 0x9D, 0x77, 0xDD, 0x0A, 0x03, 0x00}, //29273B79D77DD0A0300
-                        {0x00, 0x00, 0x0F, 0x09, 0x00, 0x00, 0xA0, 0x0F}, //25200000F090000A00F
-                        {0x2e, 0x97, 0xF2, 0xFF, 0xF6, 0x26, 0xFF, 0x0F}  //132e979f2fff626ff0f
-                        }; 
-byte canDataBufferLengthTest[6] = {8, 8, 8, 8, 8, 8};
-uint32_t canDataBufferIdTest[6] = {0x132, 0x129, 0x352, 0x292, 0x252, 0x132};
-byte lastTestMessage = 0;
-#endif
+uint8_t messageCounter = 0;    //should not be greater than BUFFER_LENGTH
 
-//static Model 3 filters, for ELM327 simulation
-uint32_t relevantIds[] = {0x108, 0x118, 0x129, 0x132, 0x1D5, 0x1D8, 0x186,
-                          0x20C, 0x212, 0x241, 0x244, 0x252, 0x257, 0x261, 0x264, 0x266, 
-                          0x267, 0x268, 0x292, 0x29D, 0x2A8, 0x2B4, 0x2C1, 0x2D2, 0x2E5, 
-                          0x312, 0x315, 0x321, 0x332, 0x334, 0x336, 0x33A, 0x352, 0x376, 
-                          0x381, 0x382, 0x395, 0x396, 0x3A1, 0x3B6, 0x3D2, 0x3F2, 0x3FE, 
-                          0x401, 0x541, 0x557, 0x5D7, 0x692};
+bool ids[2048];                             //save here ID that we care about.
+uint16_t canDataBufferId[BUFFER_LENGTH];    
+uint8_t canDataBufferLength[BUFFER_LENGTH];
+uint8_t canDataBufferData[BUFFER_LENGTH][8];
+
 bool noFilter = true;
 char btBufferCounter = 0;
 char buffer[128];
 String lineEnd = String("\n");
 
-bool getBit(byte b, byte bitNumber) {
-   return (b & (1 << bitNumber)) != 0;
-}
+static bool driver_installed = false;
 
 BluetoothSerial SerialBT;
 
 #ifdef DEBUG
-void printFrame(CAN_FRAME *message)
+void printFrame(twai_message_t &canMessage)
 {
-    Serial.print(message->id, HEX);
-    Serial.print(" ");
-    for (byte i = 0; i < message->length; i++) {
-        if(message->data.byte[i] < 16) Serial.print("0");
-        Serial.print(message->data.byte[i], HEX);
-        Serial.print(" ");
+    Serial.printf("%03x: ", canMessage.identifier);
+    for (uint8_t i = 0; i <  canMessage.data_length_code; i++) {
+        Serial.printf("%02x ", canMessage.data[i]);
     }
     Serial.println();
 }
+
+#define debug_println(msg) Serial.println(msg);
+#define debug_print(msg) Serial.print(msg);
+
+#else
+#define printFrame(canMessage) do {} while(0)
+#define debug_println(msg) do {} while(0)
+#define debug_print(msg) do {} while(0)
 #endif
 
+void processCanMessage(twai_message_t &canMessage){
+    uint8_t length = canMessage.data_length_code;
+    uint8_t lineNumber = messageCounter;
 
-bool copyDataToBuffer(CAN_FRAME *canData, byte lineNumber){
-    if(canData->length > 0 && canData->length < 9){ //messages can be 1..8 bytes long only, if not drop this message (propably corrupt)
-        canDataBufferId[lineNumber] = canData->id;
-        canDataBufferLength[lineNumber] = canData->length;
-        for(byte i = 0; i < canData->length; i++){
-            canDataBuffer[lineNumber][i] = canData->data.byte[i];
+    //print can message before filter
+    //printFrame(canMessage);
+
+    //if the can message id is in the list process it
+    if(!ids[canMessage.identifier]){
+        return;
+    }
+
+    //print can message after filter
+    //printFrame(canMessage);
+    
+    //check if this ID is already in the buffer !!! 
+    //doesn't work with mutiplexed messages, like cell voltages -> check first byte also (it's mostly multiplex index)
+    for(uint8_t i = 0; i < BUFFER_LENGTH; i++){
+        if(canDataBufferId[i] == canMessage.identifier && canDataBufferData[lineNumber][0] == canMessage.data[0]){
+            debug_print("ID ");
+            debug_print(canMessage.identifier);
+            debug_println(" allready in buffer");
+            lineNumber = i;
         }
-        return true;
+    }
+    
+    //messages can be 1..8 bytes long only, if not drop this message (propably corrupt)
+    if(0 < length && length < 9){ 
+        canDataBufferId[lineNumber] = canMessage.identifier;
+        canDataBufferLength[lineNumber] = length;
+        for(uint8_t i = 0; i < length; i++){
+            canDataBufferData[lineNumber][i] = canMessage.data[i];
+        }
+        messageCounter++;
+        if(messageCounter >= BUFFER_LENGTH) messageCounter = 0;
     }else{
-#ifdef DEBUG
-        Serial.println("Message dropped, wrong length");
-#endif              
-        return false;
+        debug_println("Message dropped, wrong length");
     }
 }
 
 void setup() {
 #ifdef DEBUG
+    delay(1000);
     Serial.begin(250000);
-    Serial.println("ESP_SMT init");
+    debug_println("ESP_SMT init");
 #endif
-#ifdef DATA_SIMULATION
-    SerialBT.begin("ESP-SMT-Simulation");
-#else //normal mode
     SerialBT.begin("ESP-SMT");
-#endif
-    CAN0.begin(500000); //for Tesla
-    CAN0.watchFor();
-    memset(canDataBuffer, 0x00, sizeof(canDataBuffer) / sizeof(canDataBuffer[0])); //clear data buffer
-    memset(ids, B00000000, sizeof(ids)); //set ID-settings to per default b00000000
-    //set default relevant ids (for ELM327. ST1110 sets its own filters)
-    for(byte i = 0; i < sizeof(relevantIds)/sizeof(relevantIds[0]); i++){
-        ids[relevantIds[i]] = 0x01; //it will work until other bits in CAN-ID settings are not defined
+
+    //Initialize configuration structures using macro initializers
+    //twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT((gpio_num_t)TX_PIN, (gpio_num_t)RX_PIN, TWAI_MODE_LISTEN_ONLY);
+    twai_general_config_t g_config = {.mode = TWAI_MODE_LISTEN_ONLY,
+                                    .tx_io = (gpio_num_t)TX_PIN,
+                                    .rx_io = (gpio_num_t)RX_PIN,
+                                    .clkout_io = TWAI_IO_UNUSED,
+                                    .bus_off_io = TWAI_IO_UNUSED,
+                                    .tx_queue_len = 1,
+                                    .rx_queue_len = 127,
+                                    .alerts_enabled = TWAI_ALERT_ALL,
+                                    .clkout_divider = 0
+                                        };
+    twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS();
+    twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+
+    //Install TWAI driver
+    if(twai_driver_install(&g_config, &t_config, &f_config) == ESP_OK){
+        debug_println("Driver installed");
+    }else{
+        debug_println("Failed to install driver");
+        return;
     }
+    
+    //Start TWAI driver
+    if(twai_start() == ESP_OK) {
+        debug_println("Driver started");
+    }else{
+        debug_println("Failed to start driver");
+        return;
+    }
+
+    //Reconfigure alerts to detect frame receive, Bus-Off error and RX queue full states
+    uint32_t alerts_to_enable = TWAI_ALERT_RX_DATA | TWAI_ALERT_ERR_PASS | TWAI_ALERT_BUS_ERROR | TWAI_ALERT_RX_QUEUE_FULL;
+    if(twai_reconfigure_alerts(alerts_to_enable, NULL) == ESP_OK){
+        debug_println("CAN Alerts reconfigured");
+    }else{
+        debug_println("Failed to reconfigure alerts");
+        return;
+    }
+
+    //TWAI driver is now successfully installed and started
+    driver_installed = true; 
+
     noFilter = false; //there are some filters
+    //set true for all IDs, because no filters applied yet
+    memset(ids, true, sizeof(ids));
+    memset(canDataBufferId, 0, sizeof(canDataBufferId) / sizeof(canDataBufferId[0]));
+    memset(canDataBufferLength, 0, sizeof(canDataBufferLength) / sizeof(canDataBufferLength[0]));
+    memset(canDataBufferData, 0, sizeof(canDataBufferData) / sizeof(canDataBufferData[0][0]));
 }
 
 
 void canLoop(){
-    CAN_FRAME canMessage;
-#ifdef DATA_SIMULATION
-//test can data
-    canMessage.rtr = 0;
-    canMessage.id = canDataBufferIdTest[lastTestMessage];
-    canMessage.extended = false;
-    canMessage.length = canDataBufferLengthTest[lastTestMessage];
-    for(byte b = 0; b < canMessage.length; b++){
-        canMessage.data.uint8[b] = canDataBufferTest[lastTestMessage][b];
+    if (!driver_installed){
+        // Driver not installed
+        delay(1000);
+        return;
     }
-    lastTestMessage++;
-    if(lastTestMessage >= sizeof(canDataBufferLengthTest)) lastTestMessage = 0;
-#else
-//real can data
-    if (CAN0.read(canMessage)) {
-#ifdef DEBUG
-    printFrame(&canMessage); //print ony real messages, not a simulation
-#endif //DEBUG
-#endif //DATA_SIMULATION
-        if(getBit(ids[canMessage.id], CAN_ID_BIT_RELEVANT)){ //check if this ID relevant for us
-//            Serial.print("Relevant ID received: ");
-//            Serial.println(canMessage.id, HEX);
-//            printFrame(&canMessage);
-            if(copyDataToBuffer(&canMessage, messageCounter)) messageCounter++;
-            if(messageCounter >= BUFFER_LENGTH) {
-                messageCounter = 0;
-                return;
-            }
+    // Check if alert happened
+    uint32_t alerts_triggered;
+    twai_read_alerts(&alerts_triggered, pdMS_TO_TICKS(1));
+    twai_status_info_t twaistatus;
+    twai_get_status_info(&twaistatus);
+
+    // Handle alerts
+    if (alerts_triggered & TWAI_ALERT_ERR_PASS) {
+        debug_println("Alert: TWAI controller has become error passive.");
+    }
+    if (alerts_triggered & TWAI_ALERT_BUS_ERROR) {
+        debug_println("Alert: A (Bit, Stuff, CRC, Form, ACK) error has occurred on the bus.");
+        debug_print("Bus error count: ");
+        debug_println(twaistatus.bus_error_count);
+    }
+    if (alerts_triggered & TWAI_ALERT_RX_QUEUE_FULL) {
+        debug_println("Alert: The RX queue is full causing a received frame to be lost.");
+        debug_print("RX buffered: ");
+        debug_println(twaistatus.msgs_to_rx);
+        debug_print("RX missed: ");
+        debug_println(twaistatus.rx_missed_count);
+        debug_print("RX overrun ");
+        debug_println(twaistatus.rx_overrun_count);
+    }
+    if (alerts_triggered & TWAI_ALERT_RX_DATA) {
+        // One or more messages received. Handle all.
+        twai_message_t message;
+        while (twai_receive(&message, 0) == ESP_OK) {
+            processCanMessage(message);
         }
-#ifndef DATA_SIMULATION //not DATA_SIMULATION     
     }
-#endif
 }
 
 String processSmtCommands(char *smtCmd){
@@ -159,59 +194,68 @@ String processSmtCommands(char *smtCmd){
     String cmd = String(smtCmd);
     String returnToSmt = String();
     String sFilter = String();
-    uint32_t filter = 0;
-#ifdef DEBUG    
-    Serial.print("smtCmd: ");
-    Serial.println(smtCmd);
-#endif
+    uint16_t filter = 0;
+
+    debug_print("smtCmd: ");
+    debug_println(smtCmd);
+
     //wait for at-commands (ELM327) or st-commands (ST1110)
-    if (!strncmp(smtCmd, "at", 2) || !strncmp(smtCmd, "st", 2)){
-        if(!strncmp(smtCmd, "atma", 4) || !strncmp(smtCmd, "stm", 3)){//data polling
-            //send response here
-            for(byte i = 0; i < BUFFER_LENGTH; i++){
-                if(canDataBufferLength[i] > 0){
-                    if(canDataBufferId[i] < 256) returnToSmt.concat("0"); //make id 3 hex digit long
-                    if(canDataBufferId[i] < 16) returnToSmt.concat("0"); //make id 2 hex digit long
-                    returnToSmt.concat(String(canDataBufferId[i], HEX));
-                    for(byte l = 0; l < canDataBufferLength[i]; l++){
-                        if(canDataBuffer[i][l] < 16) returnToSmt.concat("0"); //make data 2 digits long
-                        returnToSmt.concat(String(canDataBuffer[i][l], HEX));
-                    }
-                returnToSmt.concat(lineEnd);
-                }
-            }
-        }else if(!strncmp(smtCmd, "stfap ", 6)){//e.g. "stfap 3d2,7ff", we need 3d2, first charachters 6 and 3 length: 3d2
-            
-            sFilter = cmd.substring(9,6); //why 9,6?!? it should be 6,3!! 
-            const char * chCmd = sFilter.c_str(); //HEX string (3d2)
-            filter = strtol(chCmd, 0, 16); //convert HEX string to integer (978)
-            if(noFilter){ 
-                memset(ids, 0x00, sizeof(ids)); //if there no filters, all IDs are allowed. But we need only one => disallow all and allow one
-                noFilter = false; //no filtes at all
-#ifdef DEBUG
-            Serial.println("No IDs are allowed now");
-#endif
-            }
-#ifdef DEBUG
-            Serial.print("New filter from SMT: ");
-            Serial.println(filter, HEX);  
-#endif
-            ids[filter] = 0x01; //it will work until other bits in CAN-ID settings are not defined
-            returnToSmt.concat("OK");
-        }else if(!strncmp(smtCmd, "stfcp", 5)){
-#ifdef DEBUG
-            Serial.println("Clear all filters = allow all IDs!");
-#endif
-            memset(ids, 0x01, sizeof(ids)); //clear all filters = allow all IDs. It will work until other bits in CAN-ID settings are not defined
-            noFilter = true; //no filtes at all
-            returnToSmt.concat("OK");
-        }else{
-            //all other at* commands, we don't care, send "OK"...
-            returnToSmt.concat("OK");
-        }
-        returnToSmt.concat(">");
+    if (strncmp(smtCmd, "at", 2) && strncmp(smtCmd, "st", 2)){
+        returnToSmt.concat(lineEnd); //we are not allowed to send "NULL" to BT, send at least "CR"
+        debug_println("Unknown request");
+        //returnToSmt.concat("OK"); //sent something, but not "null"
+        return returnToSmt;  
     }
-    returnToSmt.concat(lineEnd); //always send "NewLine" at the end
+
+  	//data polling
+  	if(!strncmp(smtCmd, "atma", 4) || !strncmp(smtCmd, "stm", 3)){
+    		//create response string here
+    		for(uint8_t i = 0; i < BUFFER_LENGTH; i++){
+      			//only IDs >0 are allowed, important at initialisation
+      			if(canDataBufferId[i] == 0) continue;
+      			//all message IDs should be 3 digits long
+      			if(canDataBufferId[i] < 256) returnToSmt.concat("0"); //make id 3 hex digits long
+      			if(canDataBufferId[i] < 16) returnToSmt.concat("0"); //make id 2 hex digits long
+            returnToSmt.concat(String(canDataBufferId[i], HEX));
+      			
+      			for(uint8_t l = 0; l < canDataBufferLength[i]; l++){
+        				//all data bytes should be 2 digits long
+                if(canDataBufferData[i][l] < 16) returnToSmt.concat("0"); //make data 2 digits long
+                returnToSmt.concat(String(canDataBufferData[i][l], HEX));
+      			}
+      			canDataBufferId[i] = 0; //set ID to zero to ignore it on next run
+      			returnToSmt.concat(lineEnd);
+		    }
+	  //set filters
+	  }else if(!strncmp(smtCmd, "stfap ", 6)){//e.g. "stfap 3d2,7ff", we need 3d2, first character 6 and 3 length: 3d2
+		
+    		sFilter = cmd.substring(9,6); //why 9,6?!? it should be 6,3!! 
+    		const char * chCmd = sFilter.c_str(); //HEX string (3d2)
+    		filter = strtol(chCmd, 0, 16); //convert HEX string to integer (978)
+    		if(noFilter){ 
+    			  memset(ids, false, sizeof(ids)); //if there no filters, all IDs are allowed. But we need only one => disallow all and allow one
+    			  noFilter = false; //no filtes at all
+        }
+    
+    		debug_print("New filter from SMT: ");
+    		debug_println(filter);  
+    
+    		ids[filter] = true;
+    		returnToSmt.concat("OK");
+    //clear filters
+	  }else if(!strncmp(smtCmd, "stfcp", 5)){
+
+    		debug_println("Clear all filters = allow all IDs!");
+    
+    		memset(ids, true, sizeof(ids)); //clear all filters = allow all IDs.
+    		noFilter = true; //no filtes at all
+        debug_println("No IDs are allowed now");
+    		returnToSmt.concat("OK");
+	  }else{
+		//all other at*/st* commands, we don't care about, send "OK"...
+		    returnToSmt.concat("OK");
+	  }
+	  returnToSmt.concat(">");
     
     return returnToSmt;  
 }
@@ -219,15 +263,15 @@ String processSmtCommands(char *smtCmd){
 
 void processBtMessage(){
     String responseToBt = processSmtCommands(buffer);
-#ifdef DEBUG
-    Serial.println("BT out message: ");
-    Serial.println(responseToBt);
-#endif
+
+    //debug_println("BT out message: ");
+    //debug_println(responseToBt);
+
     SerialBT.print(responseToBt); //send String to BT
 }
 
 void btLoop(){
-    byte tmp;
+    uint8_t tmp;
     while(SerialBT.available()){
         tmp = SerialBT.read();
         //check if current char is "Carriage Return"
